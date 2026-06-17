@@ -1,0 +1,42 @@
+name: Build Level Creator IPA
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  unsigned-ipa:
+    name: Build unsigned Level Creator IPA
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build unsigned IPA
+        run: bash scripts/build_level_creator_unsigned_ipa.sh
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LevelCreator-unsigned-ipa
+          path: build/level-creator-unsigned-ipa/LevelCreator-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Publish IPA to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/level-creator-unsigned-ipa/LevelCreator-unsigned.ipa
+          generate_release_notes: true
