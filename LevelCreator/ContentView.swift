@@ -108,6 +108,14 @@ struct ContentView: View {
             .padding(.horizontal, 14)
             .padding(.top, 12)
             .padding(.bottom, 10)
+
+            if isPlaying {
+                PlayHeartHUD(health: playState.health)
+                    .padding(.top, 14)
+                    .padding(.leading, 14)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .allowsHitTesting(false)
+            }
         }
         .onAppear {
             camera = clampedCamera(x: 0, y: 3)
@@ -1010,6 +1018,24 @@ struct ContentView: View {
         default:
             return false
         }
+    }
+}
+
+private struct PlayHeartHUD: View {
+    let health: Int
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(0..<GameConstants.maxHealth, id: \.self) { index in
+                Image(systemName: index < health ? "heart.fill" : "heart")
+                    .font(.system(size: 18, weight: .black))
+                    .foregroundStyle(index < health ? Color.redPop : Color.white.opacity(0.34))
+                    .shadow(color: Color.black.opacity(0.34), radius: 4, y: 2)
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 34)
+        .background(PremiumPanelBackground(cornerRadius: 8))
     }
 }
 
