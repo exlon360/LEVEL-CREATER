@@ -488,6 +488,11 @@ struct ContentView: View {
         state.attackCooldown = max(0, state.attackCooldown - deltaTime)
         state.attackFlash = max(0, state.attackFlash - deltaTime)
         state.invulnerability = max(0, state.invulnerability - deltaTime)
+        state.jumpBuffer = queuedJump ? GameConstants.jumpBufferTime : max(0, state.jumpBuffer - deltaTime)
+        state.groundGrace = state.isGrounded ? GameConstants.coyoteTime : max(0, state.groundGrace - deltaTime)
+        state.dreamExitGrace = max(0, state.dreamExitGrace - deltaTime)
+        state.dreamBypass = max(0, state.dreamBypass - deltaTime)
+        queuedJump = false
 
         for index in state.platforms.indices {
             state.platforms[index].advance(deltaTime: deltaTime)
@@ -503,18 +508,27 @@ struct ContentView: View {
         let foot = LevelGridPoint(x: Int(state.playerX.rounded(.down)), y: Int((state.playerY + 0.45).rounded(.down)))
         let currentTile = level.tiles[foot]
         let isInWater = touchesTile(kind: .water, state: state)
-        let isInSpace = currentTile == .space || touchesTile(kind: .space, state: state)
+        let isTouchingSpace = currentTile == .space || touchesTile(kind: .space, state: state)
+        let isInSpace = isTouchingSpace && state.dreamBypass <= 0
         let isOnIce = currentTile == .ice
         let isInMud = currentTile == .mud || touchesTile(kind: .mud, state: state)
-        let spaceDirection = movement == 0 ? state.facing : movement
+        let justEnteredSpace = isInSpace && state.wasInSpace == false
 
         if isInSpace {
-            speed = GameConstants.spaceDreamSpeed
-            state.facing = spaceDirection
-            state.statusText = state.wasInSpace ? "Dream drift" : "Dream entry"
+            if justEnteredSpace {
+                let direction = dreamDirection(for: state, movement: movement)
+                state.dreamDirectionX = direction.x
+                state.dreamDirectionY = direction.y
+            }
+            state.facing = state.dreamDirectionX == 0 ? state.facing : (state.dreamDirectionX > 0 ? 1 : -1)
+            state.velocityX = state.dreamDirectionX * GameConstants.spaceDreamSpeed
+            state.velocityY = state.dreamDirectionY * GameConstants.spaceDreamSpeed
+            state.isGrounded = false
+            state.groundGrace = 0
+            state.statusText = justEnteredSpace ? "Dream entry" : "Dream rush"
         }
 
-        if isInWater {
+        if isInSpace == false && isInWater {
             speed = max(speed, GameConstants.waterMoveSpeed)
             if state.velocityY > GameConstants.waterFloatVelocity {
                 state.velocityY -= GameConstants.waterBuoyancy * deltaTime
@@ -523,53 +537,55 @@ struct ContentView: View {
             state.statusText = "Floating"
         }
 
-        if isOnIce {
+        if isInSpace == false && isOnIce {
             speed = max(speed, GameConstants.iceSpeed)
             state.statusText = "Ice slide"
         }
 
-        if isInMud {
+        if isInSpace == false && isInMud {
             speed = min(speed, GameConstants.mudSpeed)
             state.statusText = "Mud slow"
         }
 
-        if currentTile == .conveyorLeft {
+        if isInSpace == false && currentTile == .conveyorLeft {
             state.velocityX -= GameConstants.conveyorPush * deltaTime
             state.statusText = "Conveyor"
-        } else if currentTile == .conveyorRight {
+        } else if isInSpace == false && currentTile == .conveyorRight {
             state.velocityX += GameConstants.conveyorPush * deltaTime
             state.statusText = "Conveyor"
         }
 
-        if isInSpace {
-            state.velocityX = spaceDirection * GameConstants.spaceDreamSpeed
-            state.velocityY *= state.wasInSpace ? GameConstants.spaceVerticalDamping : GameConstants.spaceEntryDamping
-            if abs(state.velocityY) < GameConstants.spaceFloatSnap {
-                state.velocityY = 0
-            }
-        } else if movement == 0 {
+        if isInSpace == false && movement == 0 {
             state.velocityX *= isOnIce ? GameConstants.iceFriction : GameConstants.groundFriction
             if abs(state.velocityX) < 0.04 {
                 state.velocityX = 0
             }
-        } else {
+        } else if isInSpace == false {
             state.velocityX = movement * speed
         }
 
-        if queuedJump && (state.isGrounded || isInWater || isInSpace) {
+        if state.jumpBuffer > 0 && (state.isGrounded || state.groundGrace > 0 || isInWater || isInSpace || state.dreamExitGrace > 0) {
             if isInSpace {
-                state.velocityX = spaceDirection * GameConstants.spaceExitSpeed
+                state.velocityX = state.dreamDirectionX * GameConstants.spaceExitSpeed
+                state.velocityY = -GameConstants.spaceLaunchVelocity
+                state.dreamExitGrace = GameConstants.dreamExitGrace
+                state.dreamBypass = GameConstants.dreamJumpBypassTime
+            } else if state.dreamExitGrace > 0 {
+                state.velocityX = state.dreamDirectionX * GameConstants.spaceExitSpeed
                 state.velocityY = -GameConstants.spaceLaunchVelocity
             } else {
                 state.velocityY = isInWater && state.isGrounded == false ? -GameConstants.waterJumpVelocity : -GameConstants.jumpVelocity
             }
             state.isGrounded = false
-            state.statusText = isInSpace ? "Dream launch" : (isInWater ? "Swim" : "Jump")
+            state.groundGrace = 0
+            state.jumpBuffer = 0
+            state.statusText = (isInSpace || state.dreamExitGrace > 0) ? "Dream jump" : (isInWater ? "Swim" : "Jump")
         }
-        queuedJump = false
 
-        let activeGravity = isInSpace ? GameConstants.spaceGravity : (isInWater ? GameConstants.waterGravity : GameConstants.gravity)
-        state.velocityY += activeGravity * deltaTime
+        if isInSpace == false {
+            state.velocityY += (isInWater ? GameConstants.waterGravity : GameConstants.gravity) * deltaTime
+        }
+
         movePlayer(&state, deltaTime: deltaTime)
         handleJumpPads(&state)
         handleFeatureTiles(&state)
@@ -583,9 +599,30 @@ struct ContentView: View {
             state = respawnState(message: "Respawned", previous: state)
         }
 
-        state.wasInSpace = touchesTile(kind: .space, state: state)
+        let isStillInSpace = touchesTile(kind: .space, state: state) && state.dreamBypass <= 0
+        if state.wasInSpace && isStillInSpace == false {
+            state.dreamExitGrace = max(state.dreamExitGrace, GameConstants.dreamExitGrace)
+        }
+        state.wasInSpace = isStillInSpace
         playState = state
         centerCamera(on: CGPoint(x: state.playerX, y: state.playerY))
+    }
+
+    private func dreamDirection(for state: LevelPlayState, movement: CGFloat) -> CGPoint {
+        var x = movement != 0 ? movement : state.facing
+        var y: CGFloat = 0
+
+        if abs(state.velocityX) > GameConstants.dreamEntryVelocityThreshold && movement == 0 {
+            x = state.velocityX > 0 ? 1 : -1
+        }
+        if state.velocityY < -GameConstants.dreamEntryVelocityThreshold {
+            y = -0.72
+        } else if state.velocityY > GameConstants.dreamEntryVelocityThreshold {
+            y = 0.42
+        }
+
+        let length = max(sqrt(x * x + y * y), 0.001)
+        return CGPoint(x: x / length, y: y / length)
     }
 
     private func carryPlayerIfStanding(on state: inout LevelPlayState) {
@@ -1941,13 +1978,14 @@ private enum GameConstants {
     static let platformHeight: CGFloat = 0.68
     static let maxHealth = 3
     static let playerSpeed: CGFloat = 6.7
-    static let spaceDreamSpeed: CGFloat = 12.8
-    static let spaceExitSpeed: CGFloat = 14.6
-    static let spaceGravity: CGFloat = 1.15
-    static let spaceEntryDamping: CGFloat = 0.28
-    static let spaceVerticalDamping: CGFloat = 0.64
-    static let spaceFloatSnap: CGFloat = 0.16
-    static let spaceLaunchVelocity: CGFloat = 10.8
+    static let spaceDreamSpeed: CGFloat = 13.8
+    static let spaceExitSpeed: CGFloat = 15.2
+    static let spaceLaunchVelocity: CGFloat = 12.4
+    static let dreamExitGrace: CGFloat = 0.16
+    static let dreamEntryVelocityThreshold: CGFloat = 1.2
+    static let dreamJumpBypassTime: CGFloat = 0.18
+    static let jumpBufferTime: CGFloat = 0.14
+    static let coyoteTime: CGFloat = 0.1
     static let jumpVelocity: CGFloat = 13.6
     static let gravity: CGFloat = 23.0
     static let groundFriction: CGFloat = 0.72
@@ -2503,6 +2541,12 @@ private struct LevelPlayState {
     var attackFlash: CGFloat = 0
     var invulnerability: CGFloat = 0
     var wasInSpace = false
+    var dreamDirectionX: CGFloat = 1
+    var dreamDirectionY: CGFloat = 0
+    var dreamExitGrace: CGFloat = 0
+    var dreamBypass: CGFloat = 0
+    var jumpBuffer: CGFloat = 0
+    var groundGrace: CGFloat = 0
     var enemies: [LevelEnemyState]
     var platforms: [LevelMovingPlatformState]
     var isComplete = false
