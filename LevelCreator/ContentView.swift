@@ -7,6 +7,9 @@ struct ContentView: View {
     @State private var selectedLevelIndex = 0
     @State private var level = EditableLevel.starter()
     @State private var selectedTool: CreatorTool = .block
+    @State private var hotbarTools = CreatorTool.defaultHotbarTools
+    @State private var undoStack: [EditableLevel] = []
+    @State private var redoStack: [EditableLevel] = []
     @State private var camera = CGPoint(x: 0, y: 3)
     @State private var zoom: CGFloat = 1.0
     @State private var jumpPadPower = GameConstants.defaultJumpPadPower
@@ -50,7 +53,9 @@ struct ContentView: View {
                     isPlaying: isPlaying,
                     playState: playState,
                     applyAction: applyTool,
-                    movingDragAction: updateMovingPlatform,
+                    movingDragAction: { start, end, recordsUndo in
+                        updateMovingPlatform(start: start, end: end, recordsUndo: recordsUndo)
+                    },
                     cameraDragAction: moveCameraByDrag(dx:dy:)
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -67,9 +72,14 @@ struct ContentView: View {
                 } else {
                     EditorControls(
                         selectedTool: $selectedTool,
+                        hotbarTools: hotbarTools,
                         jumpPadPower: $jumpPadPower,
                         camera: camera,
                         zoom: zoom,
+                        canUndo: undoStack.isEmpty == false,
+                        canRedo: redoStack.isEmpty == false,
+                        undoAction: undoEdit,
+                        redoAction: redoEdit,
                         libraryAction: { isBlockLibraryPresented = true },
                         zoomInAction: zoomIn,
                         zoomOutAction: zoomOut,
@@ -87,7 +97,8 @@ struct ContentView: View {
         .sheet(isPresented: $isBlockLibraryPresented) {
             BlockLibraryView(
                 selectedTool: $selectedTool,
-                jumpPadPower: $jumpPadPower
+                jumpPadPower: $jumpPadPower,
+                hotbarTools: $hotbarTools
             )
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
@@ -125,11 +136,15 @@ struct ContentView: View {
             Button {
                 togglePlay()
             } label: {
-                Label(isPlaying ? "Creator" : "Play", systemImage: isPlaying ? "hammer.fill" : "play.fill")
-                    .font(.headline.weight(.black))
-                    .frame(minWidth: 96, minHeight: 40)
+                VStack(spacing: 5) {
+                    Image(systemName: isPlaying ? "hammer.fill" : "play.fill")
+                        .font(.system(size: 22, weight: .black))
+                    Text(isPlaying ? "Create" : "Play")
+                        .font(.caption.weight(.black))
+                }
+                .frame(width: 76, height: 62)
             }
-            .buttonStyle(PrimaryButtonStyle(isActive: isPlaying))
+            .buttonStyle(GreenModeButtonStyle())
         }
     }
 
@@ -137,6 +152,7 @@ struct ContentView: View {
         guard level.contains(point) else { return }
 
         var didEdit = true
+        recordUndoSnapshot()
         switch selectedTool {
         case .block:
             level.tiles[point] = .block
@@ -185,7 +201,7 @@ struct ContentView: View {
             removeActors(at: point)
         case .moving:
             let end = level.clamped(LevelGridPoint(x: point.x + 4, y: point.y))
-            updateMovingPlatform(start: point, end: end)
+            updateMovingPlatform(start: point, end: end, recordsUndo: false)
             return
         case .enemy:
             level.tiles[point] = nil
@@ -209,6 +225,7 @@ struct ContentView: View {
             level.movingPlatforms.removeAll { $0.touches(point) }
         case .move:
             didEdit = false
+            discardUnusedUndoSnapshot()
             break
         }
 
@@ -224,6 +241,14 @@ struct ContentView: View {
     }
 
     private func updateMovingPlatform(start: LevelGridPoint, end: LevelGridPoint) {
+        updateMovingPlatform(start: start, end: end, recordsUndo: true)
+    }
+
+    private func updateMovingPlatform(start: LevelGridPoint, end: LevelGridPoint, recordsUndo: Bool) {
+        if recordsUndo {
+            recordUndoSnapshot()
+        }
+
         let safeStart = level.clamped(start)
         var safeEnd = level.clamped(end)
         if safeEnd == safeStart {
@@ -251,8 +276,36 @@ struct ContentView: View {
     }
 
     private func defaultMovingEnd(from start: LevelGridPoint) -> LevelGridPoint {
-        let xOffset = start.x < level.width - 1 ? 1 : -1
+        let xOffset = start.x < GameConstants.worldMaxX ? 1 : -1
         return level.clamped(LevelGridPoint(x: start.x + xOffset, y: start.y))
+    }
+
+    private func recordUndoSnapshot() {
+        undoStack.append(level)
+        if undoStack.count > GameConstants.maxUndoLevels {
+            undoStack.removeFirst()
+        }
+        redoStack.removeAll()
+    }
+
+    private func discardUnusedUndoSnapshot() {
+        _ = undoStack.popLast()
+    }
+
+    private func undoEdit() {
+        guard let previous = undoStack.popLast() else { return }
+        redoStack.append(level)
+        level = previous
+        persistCurrentLevel()
+        playEditorSound(.select)
+    }
+
+    private func redoEdit() {
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(level)
+        level = next
+        persistCurrentLevel()
+        playEditorSound(.select)
     }
 
     private func persistCurrentLevel() {
@@ -295,6 +348,8 @@ struct ContentView: View {
         isPressingRight = false
         queuedJump = false
         lastTickDate = nil
+        undoStack.removeAll()
+        redoStack.removeAll()
         camera = clampedCamera(x: 0, y: 3)
     }
 
@@ -316,6 +371,7 @@ struct ContentView: View {
     }
 
     private func removeAll() {
+        recordUndoSnapshot()
         level = EditableLevel.empty()
         selectedTool = .block
         zoom = 1.0
@@ -389,11 +445,13 @@ struct ContentView: View {
     private func clampedCamera(x: CGFloat, y: CGFloat, atZoom cameraZoom: CGFloat? = nil) -> CGPoint {
         let activeZoom = cameraZoom ?? zoom
         let visible = visibleWorldSize(atZoom: activeZoom)
-        let maxX = max(0, CGFloat(level.width) - visible.width)
-        let maxY = max(0, CGFloat(level.height) - visible.height)
+        let minX = CGFloat(GameConstants.worldMinX)
+        let minY = CGFloat(GameConstants.worldMinY)
+        let maxX = CGFloat(GameConstants.worldMaxX) - visible.width
+        let maxY = CGFloat(GameConstants.worldMaxY) - visible.height
         return CGPoint(
-            x: min(max(x, 0), maxX),
-            y: min(max(y, 0), maxY)
+            x: min(max(x, minX), maxX),
+            y: min(max(y, minY), maxY)
         )
     }
 
@@ -498,7 +556,8 @@ struct ContentView: View {
         handleEnemyContact(&state)
         handleGoal(&state)
 
-        if state.playerY > CGFloat(level.height + 3) {
+        let respawnBaseY = CGFloat((state.checkpoint ?? level.start).y + GameConstants.fallRespawnOffset)
+        if state.playerY > respawnBaseY {
             state = respawnState(message: "Respawned", previous: state)
         }
 
@@ -749,15 +808,19 @@ struct ContentView: View {
     }
 
     private func isSolid(at point: LevelGridPoint, state: LevelPlayState) -> Bool {
-        if point.x < 0 || point.x >= level.width || point.y >= level.height {
+        if point.x < GameConstants.worldMinX || point.x > GameConstants.worldMaxX || point.y > GameConstants.worldMaxY {
             return true
         }
 
-        if point.y < 0 {
+        if point.y < GameConstants.worldMinY {
             return false
         }
 
-        switch level.tiles[point] {
+        guard let tile = level.tiles[point] else {
+            return false
+        }
+
+        switch tile {
         case .block:
             return true
         case .lock:
@@ -910,6 +973,7 @@ private struct Badge: View {
 private struct LevelCanvasView: View {
     @State private var lastPaintedPoint: LevelGridPoint?
     @State private var lastCameraTranslation = CGSize.zero
+    @State private var hasRecordedMovingDrag = false
 
     let level: EditableLevel
     let selectedTool: CreatorTool
@@ -918,7 +982,7 @@ private struct LevelCanvasView: View {
     let isPlaying: Bool
     let playState: LevelPlayState
     let applyAction: (LevelGridPoint) -> Void
-    let movingDragAction: (LevelGridPoint, LevelGridPoint) -> Void
+    let movingDragAction: (LevelGridPoint, LevelGridPoint, Bool) -> Void
     let cameraDragAction: (CGFloat, CGFloat) -> Void
 
     var body: some View {
@@ -1053,7 +1117,12 @@ private struct LevelCanvasView: View {
 
                     if selectedTool == .moving {
                         guard abs(value.translation.width) > 9 || abs(value.translation.height) > 9 else { return }
-                        movingDragAction(point(for: value.startLocation, cellSize: metrics.cellSize), point(for: value.location, cellSize: metrics.cellSize))
+                        movingDragAction(
+                            point(for: value.startLocation, cellSize: metrics.cellSize),
+                            point(for: value.location, cellSize: metrics.cellSize),
+                            hasRecordedMovingDrag == false
+                        )
+                        hasRecordedMovingDrag = true
                         return
                     }
 
@@ -1069,14 +1138,22 @@ private struct LevelCanvasView: View {
                     defer {
                         lastPaintedPoint = nil
                         lastCameraTranslation = .zero
+                        hasRecordedMovingDrag = false
                     }
 
                     if selectedTool == .move {
                         return
                     } else if selectedTool == .moving && (abs(value.translation.width) > 9 || abs(value.translation.height) > 9) {
-                        movingDragAction(point(for: value.startLocation, cellSize: metrics.cellSize), point(for: value.location, cellSize: metrics.cellSize))
+                        movingDragAction(
+                            point(for: value.startLocation, cellSize: metrics.cellSize),
+                            point(for: value.location, cellSize: metrics.cellSize),
+                            hasRecordedMovingDrag == false
+                        )
                     } else if selectedTool.supportsDragPainting {
-                        applyAction(point(for: value.location, cellSize: metrics.cellSize))
+                        let point = point(for: value.location, cellSize: metrics.cellSize)
+                        if point != lastPaintedPoint {
+                            applyAction(point)
+                        }
                     } else {
                         applyAction(point(for: value.location, cellSize: metrics.cellSize))
                     }
@@ -1098,7 +1175,7 @@ private struct LevelCanvasView: View {
     }
 
     private func visibleColumns() -> [Int] {
-        visibleIndices(start: camera.x, span: visibleColumnSpan, count: level.width)
+        visibleIndices(start: camera.x, span: visibleColumnSpan, lowerLimit: GameConstants.worldMinX, upperLimit: GameConstants.worldMaxX)
     }
 
     private func tileForDisplay(at point: LevelGridPoint) -> LevelTileKind? {
@@ -1110,7 +1187,7 @@ private struct LevelCanvasView: View {
     }
 
     private func visibleRows() -> [Int] {
-        visibleIndices(start: camera.y, span: visibleRowSpan, count: level.height)
+        visibleIndices(start: camera.y, span: visibleRowSpan, lowerLimit: GameConstants.worldMinY, upperLimit: GameConstants.worldMaxY)
     }
 
     private var visibleColumnSpan: CGFloat {
@@ -1121,9 +1198,9 @@ private struct LevelCanvasView: View {
         CGFloat(GameConstants.viewportRows) / zoom
     }
 
-    private func visibleIndices(start: CGFloat, span: CGFloat, count: Int) -> [Int] {
-        let lower = max(0, Int(start.rounded(.down)) - 1)
-        let upper = min(count - 1, Int((start + span).rounded(.up)) + 1)
+    private func visibleIndices(start: CGFloat, span: CGFloat, lowerLimit: Int, upperLimit: Int) -> [Int] {
+        let lower = max(lowerLimit, Int(start.rounded(.down)) - 1)
+        let upper = min(upperLimit, Int((start + span).rounded(.up)) + 1)
         guard lower <= upper else { return [] }
         return Array(lower...upper)
     }
@@ -1323,9 +1400,14 @@ private struct MovingPlatformView: View {
 
 private struct EditorControls: View {
     @Binding var selectedTool: CreatorTool
+    let hotbarTools: [CreatorTool]
     @Binding var jumpPadPower: CGFloat
     let camera: CGPoint
     let zoom: CGFloat
+    let canUndo: Bool
+    let canRedo: Bool
+    let undoAction: () -> Void
+    let redoAction: () -> Void
     let libraryAction: () -> Void
     let zoomInAction: () -> Void
     let zoomOutAction: () -> Void
@@ -1335,7 +1417,7 @@ private struct EditorControls: View {
         VStack(spacing: 9) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    ForEach(CreatorTool.hotbarTools) { tool in
+                    ForEach(hotbarTools) { tool in
                         Button {
                             selectedTool = tool
                         } label: {
@@ -1361,6 +1443,9 @@ private struct EditorControls: View {
             }
 
             HStack(spacing: 8) {
+                CompactIconButton(symbol: "arrow.uturn.backward", isEnabled: canUndo, action: undoAction)
+                CompactIconButton(symbol: "arrow.uturn.forward", isEnabled: canRedo, action: redoAction)
+
                 Button(action: libraryAction) {
                     Label("Library", systemImage: "square.grid.2x2.fill")
                         .font(.caption.weight(.black))
@@ -1457,6 +1542,7 @@ private struct JumpPadSettings: View {
 private struct BlockLibraryView: View {
     @Binding var selectedTool: CreatorTool
     @Binding var jumpPadPower: CGFloat
+    @Binding var hotbarTools: [CreatorTool]
     @Environment(\.dismiss) private var dismiss
 
     private let columns = [
@@ -1495,48 +1581,61 @@ private struct BlockLibraryView: View {
                 ScrollView(showsIndicators: false) {
                     LazyVGrid(columns: columns, spacing: 10) {
                         ForEach(CreatorTool.blockLibraryTools) { tool in
-                            Button {
-                                selectedTool = tool
-                                dismiss()
-                            } label: {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack {
-                                        Image(systemName: tool.symbolName)
-                                            .font(.system(size: 18, weight: .black))
-                                            .foregroundStyle(selectedTool == tool ? Color.black : tool.tint)
-                                        Spacer(minLength: 0)
-                                        if selectedTool == tool {
-                                            Image(systemName: "checkmark.circle.fill")
-                                                .font(.system(size: 13, weight: .black))
-                                                .foregroundStyle(Color.black.opacity(0.72))
+                            VStack(alignment: .leading, spacing: 8) {
+                                Button {
+                                    selectedTool = tool
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        HStack {
+                                            Image(systemName: tool.symbolName)
+                                                .font(.system(size: 18, weight: .black))
+                                                .foregroundStyle(selectedTool == tool ? Color.black : tool.tint)
+                                            Spacer(minLength: 0)
+                                            if selectedTool == tool {
+                                                Image(systemName: "checkmark.circle.fill")
+                                                    .font(.system(size: 13, weight: .black))
+                                                    .foregroundStyle(Color.black.opacity(0.72))
+                                            }
                                         }
+
+                                        Text(tool.title)
+                                            .font(.caption.weight(.black))
+                                            .foregroundStyle(selectedTool == tool ? Color.black : Color.white)
+                                            .lineLimit(1)
+
+                                        Text(tool.featureText)
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(selectedTool == tool ? Color.black.opacity(0.62) : Color.white.opacity(0.52))
+                                            .lineLimit(2)
+                                            .fixedSize(horizontal: false, vertical: true)
                                     }
+                                }
+                                .buttonStyle(.plain)
 
-                                    Text(tool.title)
+                                Button {
+                                    addToHotbar(tool)
+                                } label: {
+                                    Label(hotbarTools.contains(tool) ? "In Hotbar" : "Add to Hotbar", systemImage: hotbarTools.contains(tool) ? "checkmark.circle.fill" : "plus.square.fill")
                                         .font(.caption.weight(.black))
-                                        .foregroundStyle(selectedTool == tool ? Color.black : Color.white)
                                         .lineLimit(1)
-
-                                    Text(tool.featureText)
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(selectedTool == tool ? Color.black.opacity(0.62) : Color.white.opacity(0.52))
-                                        .lineLimit(2)
-                                        .fixedSize(horizontal: false, vertical: true)
+                                        .minimumScaleFactor(0.74)
+                                        .frame(maxWidth: .infinity, minHeight: 30)
                                 }
-                                .padding(10)
-                                .frame(minHeight: 104, alignment: .topLeading)
-                                .background(
-                                    selectedTool == tool
-                                        ? tool.tint
-                                        : Color.white.opacity(0.07),
-                                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                )
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .stroke(selectedTool == tool ? Color.white.opacity(0.4) : tool.tint.opacity(0.2), lineWidth: 1)
-                                }
+                                .buttonStyle(ToolButtonStyle(tint: tool.tint, isSelected: hotbarTools.contains(tool)))
+                                .disabled(hotbarTools.contains(tool))
                             }
-                            .buttonStyle(.plain)
+                            .padding(10)
+                            .frame(minHeight: 140, alignment: .topLeading)
+                            .background(
+                                selectedTool == tool
+                                    ? tool.tint
+                                    : Color.white.opacity(0.07),
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            )
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .stroke(selectedTool == tool ? Color.white.opacity(0.4) : tool.tint.opacity(0.2), lineWidth: 1)
+                            }
                         }
                     }
                     .padding(.bottom, 12)
@@ -1545,6 +1644,12 @@ private struct BlockLibraryView: View {
             .padding(16)
         }
         .preferredColorScheme(.dark)
+    }
+
+    private func addToHotbar(_ tool: CreatorTool) {
+        guard hotbarTools.contains(tool) == false else { return }
+        hotbarTools.append(tool)
+        AudioServicesPlaySystemSound(EditorSound.select.systemSoundID)
     }
 }
 
@@ -1714,6 +1819,12 @@ private struct ViewportMetrics {
 }
 
 private enum GameConstants {
+    static let worldMinX = -5000
+    static let worldMaxX = 5000
+    static let worldMinY = -500
+    static let worldMaxY = 1200
+    static let fallRespawnOffset = 35
+    static let maxUndoLevels = 100
     static let viewportColumns = 18
     static let viewportRows = 11
     static let playerWidth: CGFloat = 0.64
@@ -1768,8 +1879,6 @@ private enum EditorSound {
 }
 
 private struct EditableLevel {
-    var width = 42
-    var height = 16
     var tiles: [LevelGridPoint: LevelTileKind]
     var enemies: Set<LevelGridPoint>
     var movingPlatforms: [LevelMovingPlatform]
@@ -1805,26 +1914,34 @@ private struct EditableLevel {
     }
 
     func contains(_ point: LevelGridPoint) -> Bool {
-        point.x >= 0 && point.x < width && point.y >= 0 && point.y < height
+        point.x >= GameConstants.worldMinX &&
+            point.x <= GameConstants.worldMaxX &&
+            point.y >= GameConstants.worldMinY &&
+            point.y <= GameConstants.worldMaxY
     }
 
     func clamped(_ point: LevelGridPoint) -> LevelGridPoint {
         LevelGridPoint(
-            x: min(max(point.x, 0), width - 1),
-            y: min(max(point.y, 0), height - 1)
+            x: min(max(point.x, GameConstants.worldMinX), GameConstants.worldMaxX),
+            y: min(max(point.y, GameConstants.worldMinY), GameConstants.worldMaxY)
         )
     }
 
     func isSolid(at point: LevelGridPoint) -> Bool {
-        if point.x < 0 || point.x >= width || point.y >= height {
+        if point.x < GameConstants.worldMinX || point.x > GameConstants.worldMaxX || point.y > GameConstants.worldMaxY {
             return true
         }
 
-        if point.y < 0 {
+        if point.y < GameConstants.worldMinY {
             return false
         }
 
-        return tiles[point] == .block
+        switch tiles[point] {
+        case .block, .lock:
+            return true
+        default:
+            return false
+        }
     }
 }
 
@@ -1991,7 +2108,7 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
 
     var id: String { rawValue }
 
-    static let hotbarTools: [CreatorTool] = [
+    static let defaultHotbarTools: [CreatorTool] = [
         .block, .kill, .water, .space, .jumpPad,
         .moving, .enemy, .start, .end, .delete, .move
     ]
@@ -2336,23 +2453,19 @@ private struct LevelMovingPlatformState: Identifiable {
     }
 }
 
-private struct PrimaryButtonStyle: ButtonStyle {
-    let isActive: Bool
-
+private struct GreenModeButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .foregroundStyle(isActive ? Color.black : Color.white)
-            .padding(.horizontal, 12)
+            .foregroundStyle(Color.black)
             .background(
-                isActive
-                    ? Color.mintPop
-                    : Color.white.opacity(configuration.isPressed ? 0.16 : 0.09),
+                Color.mintPop.opacity(configuration.isPressed ? 0.78 : 0.98),
                 in: RoundedRectangle(cornerRadius: 8, style: .continuous)
             )
             .overlay {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(Color.white.opacity(isActive ? 0.36 : 0.14), lineWidth: 1)
+                    .stroke(Color.white.opacity(0.42), lineWidth: 1)
             }
+            .shadow(color: Color.mintPop.opacity(0.35), radius: 12, y: 5)
             .scaleEffect(configuration.isPressed ? 0.97 : 1)
     }
 }
