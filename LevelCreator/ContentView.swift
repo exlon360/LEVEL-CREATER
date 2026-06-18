@@ -506,11 +506,12 @@ struct ContentView: View {
         let isInSpace = currentTile == .space || touchesTile(kind: .space, state: state)
         let isOnIce = currentTile == .ice
         let isInMud = currentTile == .mud || touchesTile(kind: .mud, state: state)
+        let spaceDirection = movement == 0 ? state.facing : movement
 
         if isInSpace {
-            speed = GameConstants.boostSpeed
-            state.velocityX += state.facing * 2.6 * deltaTime
-            state.statusText = "Space boost"
+            speed = GameConstants.spaceDreamSpeed
+            state.facing = spaceDirection
+            state.statusText = state.wasInSpace ? "Dream drift" : "Dream entry"
         }
 
         if isInWater {
@@ -540,7 +541,13 @@ struct ContentView: View {
             state.statusText = "Conveyor"
         }
 
-        if movement == 0 {
+        if isInSpace {
+            state.velocityX = spaceDirection * GameConstants.spaceDreamSpeed
+            state.velocityY *= state.wasInSpace ? GameConstants.spaceVerticalDamping : GameConstants.spaceEntryDamping
+            if abs(state.velocityY) < GameConstants.spaceFloatSnap {
+                state.velocityY = 0
+            }
+        } else if movement == 0 {
             state.velocityX *= isOnIce ? GameConstants.iceFriction : GameConstants.groundFriction
             if abs(state.velocityX) < 0.04 {
                 state.velocityX = 0
@@ -549,14 +556,20 @@ struct ContentView: View {
             state.velocityX = movement * speed
         }
 
-        if queuedJump && (state.isGrounded || isInWater) {
-            state.velocityY = isInWater && state.isGrounded == false ? -GameConstants.waterJumpVelocity : -GameConstants.jumpVelocity
+        if queuedJump && (state.isGrounded || isInWater || isInSpace) {
+            if isInSpace {
+                state.velocityX = spaceDirection * GameConstants.spaceExitSpeed
+                state.velocityY = -GameConstants.spaceLaunchVelocity
+            } else {
+                state.velocityY = isInWater && state.isGrounded == false ? -GameConstants.waterJumpVelocity : -GameConstants.jumpVelocity
+            }
             state.isGrounded = false
-            state.statusText = isInWater ? "Swim" : "Jump"
+            state.statusText = isInSpace ? "Dream launch" : (isInWater ? "Swim" : "Jump")
         }
         queuedJump = false
 
-        state.velocityY += (isInWater ? GameConstants.waterGravity : GameConstants.gravity) * deltaTime
+        let activeGravity = isInSpace ? GameConstants.spaceGravity : (isInWater ? GameConstants.waterGravity : GameConstants.gravity)
+        state.velocityY += activeGravity * deltaTime
         movePlayer(&state, deltaTime: deltaTime)
         handleJumpPads(&state)
         handleFeatureTiles(&state)
@@ -570,6 +583,7 @@ struct ContentView: View {
             state = respawnState(message: "Respawned", previous: state)
         }
 
+        state.wasInSpace = touchesTile(kind: .space, state: state)
         playState = state
         centerCamera(on: CGPoint(x: state.playerX, y: state.playerY))
     }
@@ -1287,6 +1301,10 @@ private struct TileCell: View {
                     }
                 }
 
+            if tile == .space {
+                SpaceBlockTexture(point: point)
+            }
+
             if let tile = tile {
                 Image(systemName: tile.symbolName)
                     .font(.system(size: 13, weight: .black))
@@ -1334,6 +1352,50 @@ private struct TileCell: View {
         return (point.x + point.y).isMultiple(of: 2)
             ? Color.white.opacity(0.035)
             : Color.white.opacity(0.022)
+    }
+}
+
+private struct SpaceBlockTexture: View {
+    let point: LevelGridPoint
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.08, green: 0.04, blue: 0.18),
+                        Color(red: 0.08, green: 0.18, blue: 0.38),
+                        Color(red: 0.26, green: 0.12, blue: 0.42)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+
+                ForEach(0..<7, id: \.self) { index in
+                    Circle()
+                        .fill(index.isMultiple(of: 3) ? Color.gold.opacity(0.86) : Color.white.opacity(0.72))
+                        .frame(width: starSize(index), height: starSize(index))
+                        .position(starPosition(index, in: proxy.size))
+                }
+
+                Capsule()
+                    .fill(Color.white.opacity(0.16))
+                    .frame(width: proxy.size.width * 0.68, height: max(1.4, proxy.size.height * 0.07))
+                    .rotationEffect(.degrees(-32))
+                    .offset(x: -proxy.size.width * 0.08, y: proxy.size.height * 0.1)
+            }
+        }
+    }
+
+    private func starSize(_ index: Int) -> CGFloat {
+        CGFloat(2 + abs(point.x * 13 + point.y * 7 + index * 5) % 4)
+    }
+
+    private func starPosition(_ index: Int, in size: CGSize) -> CGPoint {
+        let seed = abs(point.x * 41 + point.y * 29 + index * 53)
+        let x = CGFloat((seed % 82) + 9) / 100
+        let y = CGFloat(((seed / 7) % 82) + 9) / 100
+        return CGPoint(x: size.width * x, y: size.height * y)
     }
 }
 
@@ -1879,7 +1941,13 @@ private enum GameConstants {
     static let platformHeight: CGFloat = 0.68
     static let maxHealth = 3
     static let playerSpeed: CGFloat = 6.7
-    static let boostSpeed: CGFloat = 9.6
+    static let spaceDreamSpeed: CGFloat = 12.8
+    static let spaceExitSpeed: CGFloat = 14.6
+    static let spaceGravity: CGFloat = 1.15
+    static let spaceEntryDamping: CGFloat = 0.28
+    static let spaceVerticalDamping: CGFloat = 0.64
+    static let spaceFloatSnap: CGFloat = 0.16
+    static let spaceLaunchVelocity: CGFloat = 10.8
     static let jumpVelocity: CGFloat = 13.6
     static let gravity: CGFloat = 23.0
     static let groundFriction: CGFloat = 0.72
@@ -2044,7 +2112,7 @@ private enum LevelTileKind: Equatable {
         case .water:
             return "drop.fill"
         case .space:
-            return "bolt.fill"
+            return "sparkles"
         case .jumpPad(_):
             return "arrow.up.circle.fill"
         case .ice:
@@ -2079,7 +2147,7 @@ private enum LevelTileKind: Equatable {
         case .water:
             return Color(red: 0.08, green: 0.48, blue: 0.72)
         case .space:
-            return Color(red: 0.78, green: 0.56, blue: 0.16)
+            return Color(red: 0.09, green: 0.08, blue: 0.24)
         case .jumpPad(_):
             return Color(red: 0.1, green: 0.64, blue: 0.38)
         case .ice:
@@ -2112,7 +2180,7 @@ private enum LevelTileKind: Equatable {
         case .water:
             return Color(red: 0.72, green: 0.95, blue: 1.0)
         case .space:
-            return Color(red: 1.0, green: 0.96, blue: 0.62)
+            return Color(red: 0.92, green: 0.98, blue: 1.0)
         case .jumpPad(_):
             return Color(red: 0.74, green: 1.0, blue: 0.72)
         case .ice:
@@ -2181,7 +2249,7 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
         case .water:
             return "Water"
         case .space:
-            return "Space"
+            return "Dream"
         case .jumpPad:
             return "Pad"
         case .ice:
@@ -2229,6 +2297,8 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
             return "Drag from a red block to set its lethal path."
         case .kill:
             return "Kill blocks respawn the player on touch."
+        case .space:
+            return "Dream blocks glide fast and launch on jump."
         case .move:
             return "Drag the board to move the camera."
         case .jumpPad:
@@ -2282,7 +2352,7 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
         case .water:
             return "drop.fill"
         case .space:
-            return "bolt.fill"
+            return "sparkles"
         case .jumpPad:
             return "arrow.up.circle.fill"
         case .ice:
@@ -2331,7 +2401,7 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
         case .water:
             return Color(red: 0.34, green: 0.78, blue: 1.0)
         case .space:
-            return Color.gold
+            return Color(red: 0.58, green: 0.74, blue: 1.0)
         case .jumpPad:
             return Color.mintPop
         case .ice:
@@ -2376,7 +2446,7 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
         case .water:
             return "Float and swim"
         case .space:
-            return "Fast boost zone"
+            return "Dream drift block"
         case .jumpPad:
             return "Custom launch power"
         case .ice:
@@ -2432,6 +2502,7 @@ private struct LevelPlayState {
     var attackCooldown: CGFloat = 0
     var attackFlash: CGFloat = 0
     var invulnerability: CGFloat = 0
+    var wasInSpace = false
     var enemies: [LevelEnemyState]
     var platforms: [LevelMovingPlatformState]
     var isComplete = false
