@@ -28,22 +28,24 @@ struct ContentView: View {
             AppBackdrop()
 
             VStack(spacing: 10) {
-                header
+                if isPlaying == false {
+                    header
 
-                LevelControls(
-                    levelIndex: selectedLevelIndex,
-                    levelCount: levels.count,
-                    previousAction: previousLevel,
-                    nextAction: nextLevel,
-                    addAction: addLevel
-                )
+                    LevelControls(
+                        levelIndex: selectedLevelIndex,
+                        levelCount: levels.count,
+                        previousAction: previousLevel,
+                        nextAction: nextLevel,
+                        addAction: addLevel
+                    )
 
-                StatusStrip(
-                    isPlaying: isPlaying,
-                    selectedTool: selectedTool,
-                    level: level,
-                    playState: playState
-                )
+                    StatusStrip(
+                        isPlaying: isPlaying,
+                        selectedTool: selectedTool,
+                        level: level,
+                        playState: playState
+                    )
+                }
 
                 LevelCanvasView(
                     level: level,
@@ -54,7 +56,12 @@ struct ContentView: View {
                     playState: playState,
                     applyAction: applyTool,
                     movingDragAction: { start, end, recordsUndo in
-                        updateMovingPlatform(start: start, end: end, recordsUndo: recordsUndo)
+                        updateMovingPlatform(
+                            start: start,
+                            end: end,
+                            isLethal: selectedTool == .redMoving,
+                            recordsUndo: recordsUndo
+                        )
                     },
                     cameraDragAction: moveCameraByDrag(dx:dy:)
                 )
@@ -67,6 +74,7 @@ struct ContentView: View {
                         isPressingRight: $isPressingRight,
                         jumpAction: { queuedJump = true },
                         attackAction: performAttack,
+                        createAction: togglePlay,
                         canAttack: playState.attackCooldown <= 0
                     )
                 } else {
@@ -199,9 +207,9 @@ struct ContentView: View {
         case .lock:
             level.tiles[point] = .lock
             removeActors(at: point)
-        case .moving:
+        case .moving, .redMoving:
             let end = level.clamped(LevelGridPoint(x: point.x + 4, y: point.y))
-            updateMovingPlatform(start: point, end: end, recordsUndo: false)
+            updateMovingPlatform(start: point, end: end, isLethal: selectedTool == .redMoving, recordsUndo: false)
             return
         case .enemy:
             level.tiles[point] = nil
@@ -241,10 +249,10 @@ struct ContentView: View {
     }
 
     private func updateMovingPlatform(start: LevelGridPoint, end: LevelGridPoint) {
-        updateMovingPlatform(start: start, end: end, recordsUndo: true)
+        updateMovingPlatform(start: start, end: end, isLethal: selectedTool == .redMoving, recordsUndo: true)
     }
 
-    private func updateMovingPlatform(start: LevelGridPoint, end: LevelGridPoint, recordsUndo: Bool) {
+    private func updateMovingPlatform(start: LevelGridPoint, end: LevelGridPoint, isLethal: Bool, recordsUndo: Bool) {
         if recordsUndo {
             recordUndoSnapshot()
         }
@@ -267,8 +275,9 @@ struct ContentView: View {
             }
             level.tiles[baseStart] = nil
             level.movingPlatforms[index].end = safeEnd
+            level.movingPlatforms[index].isLethal = isLethal
         } else {
-            level.movingPlatforms.append(LevelMovingPlatform(start: safeStart, end: safeEnd))
+            level.movingPlatforms.append(LevelMovingPlatform(start: safeStart, end: safeEnd, isLethal: isLethal))
         }
 
         persistCurrentLevel()
@@ -461,7 +470,7 @@ struct ContentView: View {
             playEditorSound(.erase)
         case .jumpPad:
             playEditorSound(.jumpPad)
-        case .moving:
+        case .moving, .redMoving:
             playEditorSound(.platform)
         default:
             playEditorSound(.place)
@@ -569,7 +578,7 @@ struct ContentView: View {
         guard state.velocityY >= -0.1 else { return }
 
         let playerBottom = state.playerY + GameConstants.playerHeight / 2
-        for platform in state.platforms {
+        for platform in state.platforms where platform.isLethal == false {
             let top = platform.previousY - GameConstants.platformHeight / 2
             let withinX = abs(state.playerX - platform.previousX) < GameConstants.platformWidth * 0.62
             let standingOnTop = abs(playerBottom - top) < 0.18
@@ -637,6 +646,11 @@ struct ContentView: View {
     private func handleHazards(_ state: inout LevelPlayState) {
         if touchesTile(kind: .kill, state: state) {
             state = respawnState(message: "Kill block", previous: state)
+            return
+        }
+
+        if touchesLethalPlatform(state: state) {
+            state = respawnState(message: "Moving kill block", previous: state)
         }
     }
 
@@ -775,16 +789,15 @@ struct ContentView: View {
         return false
     }
 
-    private func collides(centerX: CGFloat, centerY: CGFloat, state: LevelPlayState) -> Bool {
-        let halfWidth = GameConstants.playerWidth / 2
-        let halfHeight = GameConstants.playerHeight / 2
-        let playerRect = CGRect(
-            x: centerX - halfWidth,
-            y: centerY - halfHeight,
-            width: GameConstants.playerWidth,
-            height: GameConstants.playerHeight
-        )
+    private func touchesLethalPlatform(state: LevelPlayState) -> Bool {
+        let rect = playerRect(centerX: state.playerX, centerY: state.playerY)
+        return state.platforms.contains { platform in
+            platform.isLethal && rect.intersects(platform.collisionRect)
+        }
+    }
 
+    private func collides(centerX: CGFloat, centerY: CGFloat, state: LevelPlayState) -> Bool {
+        let playerRect = playerRect(centerX: centerX, centerY: centerY)
         let left = Int(playerRect.minX.rounded(.down))
         let right = Int(playerRect.maxX.rounded(.down))
         let top = Int(playerRect.minY.rounded(.down))
@@ -798,13 +811,24 @@ struct ContentView: View {
             }
         }
 
-        for platform in state.platforms {
+        for platform in state.platforms where platform.isLethal == false {
             if playerRect.intersects(platform.collisionRect) {
                 return true
             }
         }
 
         return false
+    }
+
+    private func playerRect(centerX: CGFloat, centerY: CGFloat) -> CGRect {
+        let halfWidth = GameConstants.playerWidth / 2
+        let halfHeight = GameConstants.playerHeight / 2
+        return CGRect(
+            x: centerX - halfWidth,
+            y: centerY - halfHeight,
+            width: GameConstants.playerWidth,
+            height: GameConstants.playerHeight
+        )
     }
 
     private func isSolid(at point: LevelGridPoint, state: LevelPlayState) -> Bool {
@@ -1037,7 +1061,7 @@ private struct LevelCanvasView: View {
             if isPlaying {
                 ForEach(playState.platforms) { platform in
                     if isVisible(x: platform.x, y: platform.y) {
-                        MovingPlatformView()
+                        MovingPlatformView(isLethal: platform.isLethal)
                             .frame(width: metrics.cellSize * GameConstants.platformWidth, height: metrics.cellSize * GameConstants.platformHeight)
                             .position(
                                 x: (platform.x - camera.x) * metrics.cellSize,
@@ -1072,7 +1096,7 @@ private struct LevelCanvasView: View {
             } else {
                 ForEach(level.movingPlatforms) { platform in
                     if isVisible(point: platform.start) {
-                        MovingPlatformView()
+                        MovingPlatformView(isLethal: platform.isLethal)
                             .frame(width: metrics.cellSize * GameConstants.platformWidth, height: metrics.cellSize * GameConstants.platformHeight)
                             .position(
                                 x: pointCenter(platform.start, metrics: metrics).x,
@@ -1083,9 +1107,9 @@ private struct LevelCanvasView: View {
                     if isVisible(point: platform.end) {
                         Image(systemName: "arrow.right.circle.fill")
                             .font(.system(size: max(16, metrics.cellSize * 0.58), weight: .black))
-                            .foregroundStyle(Color.purplePop)
+                            .foregroundStyle(platform.tint)
                             .rotationEffect(angle(for: platform))
-                            .shadow(color: Color.purplePop.opacity(0.45), radius: 8)
+                            .shadow(color: platform.tint.opacity(0.45), radius: 8)
                             .position(
                                 x: pointCenter(platform.end, metrics: metrics).x,
                                 y: pointCenter(platform.end, metrics: metrics).y
@@ -1115,7 +1139,7 @@ private struct LevelCanvasView: View {
                         return
                     }
 
-                    if selectedTool == .moving {
+                    if selectedTool.isMovingPlatformTool {
                         guard abs(value.translation.width) > 9 || abs(value.translation.height) > 9 else { return }
                         movingDragAction(
                             point(for: value.startLocation, cellSize: metrics.cellSize),
@@ -1143,7 +1167,7 @@ private struct LevelCanvasView: View {
 
                     if selectedTool == .move {
                         return
-                    } else if selectedTool == .moving && (abs(value.translation.width) > 9 || abs(value.translation.height) > 9) {
+                    } else if selectedTool.isMovingPlatformTool && (abs(value.translation.width) > 9 || abs(value.translation.height) > 9) {
                         movingDragAction(
                             point(for: value.startLocation, cellSize: metrics.cellSize),
                             point(for: value.location, cellSize: metrics.cellSize),
@@ -1169,7 +1193,7 @@ private struct LevelCanvasView: View {
             path.addLine(to: end)
         }
         .stroke(
-            Color.purplePop.opacity(isPlaying ? 0.32 : 0.72),
+            platform.tint.opacity(isPlaying ? 0.32 : 0.72),
             style: StrokeStyle(lineWidth: max(2, metrics.cellSize * 0.12), lineCap: .round, dash: isPlaying ? [6, 8] : [])
         )
     }
@@ -1376,11 +1400,23 @@ private struct EnemyView: View {
 }
 
 private struct MovingPlatformView: View {
+    let isLethal: Bool
+
+    private var colors: [Color] {
+        isLethal
+            ? [Color.redPop, Color(red: 0.68, green: 0.04, blue: 0.08)]
+            : [Color.purplePop, Color(red: 0.55, green: 0.28, blue: 1.0)]
+    }
+
+    private var shadowTint: Color {
+        isLethal ? Color.redPop : Color.purplePop
+    }
+
     var body: some View {
         RoundedRectangle(cornerRadius: 6, style: .continuous)
             .fill(
                 LinearGradient(
-                    colors: [Color.purplePop, Color(red: 0.55, green: 0.28, blue: 1.0)],
+                    colors: colors,
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
@@ -1394,7 +1430,7 @@ private struct MovingPlatformView: View {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .stroke(Color.white.opacity(0.24), lineWidth: 1)
             }
-            .shadow(color: Color.purplePop.opacity(0.42), radius: 9, y: 4)
+            .shadow(color: shadowTint.opacity(0.42), radius: 9, y: 4)
     }
 }
 
@@ -1658,34 +1694,44 @@ private struct PlayControls: View {
     @Binding var isPressingRight: Bool
     let jumpAction: () -> Void
     let attackAction: () -> Void
+    let createAction: () -> Void
     let canAttack: Bool
 
     var body: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 8) {
-                HoldButton(symbol: "chevron.left", title: "Left", isPressed: $isPressingLeft)
-                HoldButton(symbol: "chevron.right", title: "Right", isPressed: $isPressingRight)
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    HoldButton(symbol: "chevron.left", title: "Left", isPressed: $isPressingLeft)
+                    HoldButton(symbol: "chevron.right", title: "Right", isPressed: $isPressingRight)
+                }
+
+                Spacer(minLength: 8)
+
+                InstantActionButton(
+                    symbol: "arrow.up",
+                    title: "Jump",
+                    tint: Color.mintPop,
+                    width: 76,
+                    isEnabled: true,
+                    action: jumpAction
+                )
+
+                InstantActionButton(
+                    symbol: "burst.fill",
+                    title: "Attack",
+                    tint: Color.gold,
+                    width: 84,
+                    isEnabled: canAttack,
+                    action: attackAction
+                )
             }
 
-            Spacer(minLength: 8)
-
-            InstantActionButton(
-                symbol: "arrow.up",
-                title: "Jump",
-                tint: Color.mintPop,
-                width: 76,
-                isEnabled: true,
-                action: jumpAction
-            )
-
-            InstantActionButton(
-                symbol: "burst.fill",
-                title: "Attack",
-                tint: Color.gold,
-                width: 84,
-                isEnabled: canAttack,
-                action: attackAction
-            )
+            Button(action: createAction) {
+                Label("Create", systemImage: "hammer.fill")
+                    .font(.headline.weight(.black))
+                    .frame(maxWidth: .infinity, minHeight: 40)
+            }
+            .buttonStyle(GreenModeButtonStyle())
         }
         .padding(10)
         .background(PremiumPanelBackground(cornerRadius: 8))
@@ -1954,15 +2000,21 @@ private struct LevelMovingPlatform: Identifiable, Equatable {
     let id: UUID
     var start: LevelGridPoint
     var end: LevelGridPoint
+    var isLethal: Bool
 
-    init(id: UUID = UUID(), start: LevelGridPoint, end: LevelGridPoint) {
+    init(id: UUID = UUID(), start: LevelGridPoint, end: LevelGridPoint, isLethal: Bool = false) {
         self.id = id
         self.start = start
         self.end = end
+        self.isLethal = isLethal
     }
 
     func touches(_ point: LevelGridPoint) -> Bool {
         start == point || end == point
+    }
+
+    var tint: Color {
+        isLethal ? Color.redPop : Color.purplePop
     }
 }
 
@@ -2100,6 +2152,7 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
     case key
     case lock
     case moving
+    case redMoving
     case enemy
     case start
     case end
@@ -2110,13 +2163,13 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
 
     static let defaultHotbarTools: [CreatorTool] = [
         .block, .kill, .water, .space, .jumpPad,
-        .moving, .enemy, .start, .end, .delete, .move
+        .moving, .redMoving, .enemy, .start, .end, .delete, .move
     ]
 
     static let blockLibraryTools: [CreatorTool] = [
         .block, .kill, .water, .space, .jumpPad,
         .ice, .mud, .conveyorLeft, .conveyorRight, .spring,
-        .checkpoint, .heal, .coin, .key, .lock
+        .checkpoint, .heal, .coin, .key, .lock, .redMoving
     ]
 
     var title: String {
@@ -2153,6 +2206,8 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
             return "Lock"
         case .moving:
             return "Moving"
+        case .redMoving:
+            return "Red Move"
         case .enemy:
             return "Enemy"
         case .start:
@@ -2170,6 +2225,8 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
         switch self {
         case .moving:
             return "Drag from a purple block to set its arrow path."
+        case .redMoving:
+            return "Drag from a red block to set its lethal path."
         case .kill:
             return "Kill blocks respawn the player on touch."
         case .move:
@@ -2207,9 +2264,13 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
         switch self {
         case .block, .kill, .water, .space, .jumpPad, .ice, .mud, .conveyorLeft, .conveyorRight, .spring, .checkpoint, .heal, .coin, .key, .lock, .delete:
             return true
-        case .moving, .enemy, .start, .end, .move:
+        case .moving, .redMoving, .enemy, .start, .end, .move:
             return false
         }
+    }
+
+    var isMovingPlatformTool: Bool {
+        self == .moving || self == .redMoving
     }
 
     var symbolName: String {
@@ -2246,6 +2307,8 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
             return "lock.fill"
         case .moving:
             return "arrow.left.and.right.square.fill"
+        case .redMoving:
+            return "xmark.diamond.fill"
         case .enemy:
             return "exclamationmark.triangle.fill"
         case .start:
@@ -2289,6 +2352,8 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
             return Color(red: 0.72, green: 0.74, blue: 0.82)
         case .moving:
             return Color.purplePop
+        case .redMoving:
+            return Color.redPop
         case .enemy:
             return Color(red: 1.0, green: 0.44, blue: 0.5)
         case .start:
@@ -2336,6 +2401,8 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
             return "Requires key"
         case .moving:
             return "Purple path block"
+        case .redMoving:
+            return "Moving kill block"
         case .enemy:
             return "Walking hazard"
         case .start:
@@ -2397,6 +2464,7 @@ private struct LevelEnemyState: Identifiable {
 
 private struct LevelMovingPlatformState: Identifiable {
     let id: UUID
+    let isLethal: Bool
     let startX: CGFloat
     let startY: CGFloat
     let endX: CGFloat
@@ -2410,6 +2478,7 @@ private struct LevelMovingPlatformState: Identifiable {
 
     init(platform: LevelMovingPlatform) {
         id = platform.id
+        isLethal = platform.isLethal
         startX = CGFloat(platform.start.x) + 0.5
         startY = CGFloat(platform.start.y) + 0.5
         endX = CGFloat(platform.end.x) + 0.5
