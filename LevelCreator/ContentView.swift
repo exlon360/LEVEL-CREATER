@@ -1,11 +1,12 @@
 import AudioToolbox
 import Combine
+import Foundation
 import SwiftUI
 
 struct ContentView: View {
-    @State private var levels = EditableLevel.defaultSet()
+    @State private var levels: [EditableLevel]
     @State private var selectedLevelIndex = 0
-    @State private var level = EditableLevel.starter()
+    @State private var level: EditableLevel
     @State private var selectedTool: CreatorTool = .block
     @State private var hotbarTools = CreatorTool.defaultHotbarTools
     @State private var undoStack: [EditableLevel] = []
@@ -15,13 +16,21 @@ struct ContentView: View {
     @State private var jumpPadPower = GameConstants.defaultJumpPadPower
     @State private var isBlockLibraryPresented = false
     @State private var isPlaying = false
-    @State private var playState = LevelPlayState(level: EditableLevel.starter())
+    @State private var playState: LevelPlayState
     @State private var isPressingLeft = false
     @State private var isPressingRight = false
     @State private var queuedJump = false
     @State private var lastTickDate: Date?
 
     private let gameTimer = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
+
+    init() {
+        let savedLevels = EditableLevel.savedSet()
+        let initialLevel = savedLevels.first ?? EditableLevel.starter()
+        _levels = State(initialValue: savedLevels)
+        _level = State(initialValue: initialLevel)
+        _playState = State(initialValue: LevelPlayState(level: initialLevel))
+    }
 
     var body: some View {
         ZStack {
@@ -36,7 +45,8 @@ struct ContentView: View {
                         levelCount: levels.count,
                         previousAction: previousLevel,
                         nextAction: nextLevel,
-                        addAction: addLevel
+                        addAction: addLevel,
+                        saveAction: saveCustomLevel
                     )
 
                     StatusStrip(
@@ -207,6 +217,12 @@ struct ContentView: View {
         case .lock:
             level.tiles[point] = .lock
             removeActors(at: point)
+        case .turret:
+            level.tiles[point] = .turret
+            removeActors(at: point)
+        case .homingTurret:
+            level.tiles[point] = .homingTurret
+            removeActors(at: point)
         case .moving, .redMoving:
             let end = level.clamped(LevelGridPoint(x: point.x + 4, y: point.y))
             updateMovingPlatform(start: point, end: end, isLethal: selectedTool == .redMoving, recordsUndo: false)
@@ -337,6 +353,15 @@ struct ContentView: View {
         selectedLevelIndex = levels.count - 1
         loadLevel(newLevel)
         playEditorSound(.select)
+    }
+
+    private func saveCustomLevel() {
+        persistCurrentLevel()
+        if EditableLevel.saveCustomSet(levels) {
+            playEditorSound(.select)
+        } else {
+            playEditorSound(.erase)
+        }
     }
 
     private func selectLevel(_ index: Int) {
@@ -589,8 +614,11 @@ struct ContentView: View {
         movePlayer(&state, deltaTime: deltaTime)
         handleJumpPads(&state)
         handleFeatureTiles(&state)
+        updateTurrets(&state, deltaTime: deltaTime)
+        moveProjectiles(&state, deltaTime: deltaTime)
         moveEnemies(&state, deltaTime: deltaTime)
         handleHazards(&state)
+        handleProjectileContact(&state)
         handleEnemyContact(&state)
         handleGoal(&state)
 
@@ -661,6 +689,63 @@ struct ContentView: View {
         }
     }
 
+    private func updateTurrets(_ state: inout LevelPlayState, deltaTime: CGFloat) {
+        for point in Array(state.turretCooldowns.keys) {
+            state.turretCooldowns[point] = max(0, (state.turretCooldowns[point] ?? 0) - deltaTime)
+        }
+
+        let player = CGPoint(x: state.playerX, y: state.playerY)
+        for (point, tile) in level.tiles {
+            guard tile == .turret || tile == .homingTurret else { continue }
+
+            let origin = CGPoint(x: CGFloat(point.x) + 0.5, y: CGFloat(point.y) + 0.5)
+            let distance = hypot(player.x - origin.x, player.y - origin.y)
+            guard distance <= GameConstants.turretRange else { continue }
+            guard (state.turretCooldowns[point] ?? 0) <= 0 else { continue }
+            guard state.projectiles.count < GameConstants.maxProjectiles else { continue }
+
+            let isHoming = tile == .homingTurret
+            state.projectiles.append(LevelProjectileState(origin: origin, target: player, isHoming: isHoming))
+            state.turretCooldowns[point] = isHoming ? GameConstants.homingTurretFireDelay : GameConstants.turretFireDelay
+        }
+    }
+
+    private func moveProjectiles(_ state: inout LevelPlayState, deltaTime: CGFloat) {
+        let player = CGPoint(x: state.playerX, y: state.playerY)
+        for index in state.projectiles.indices {
+            state.projectiles[index].advance(toward: player, deltaTime: deltaTime)
+        }
+
+        let hasKey = state.hasKey
+        state.projectiles.removeAll { projectile in
+            projectile.life <= 0 ||
+                projectile.x < CGFloat(GameConstants.worldMinX) ||
+                projectile.x > CGFloat(GameConstants.worldMaxX) ||
+                projectile.y < CGFloat(GameConstants.worldMinY) ||
+                projectile.y > CGFloat(GameConstants.worldMaxY) ||
+                projectileHitsSolid(projectile, hasKey: hasKey)
+        }
+    }
+
+    private func projectileHitsSolid(_ projectile: LevelProjectileState, hasKey: Bool) -> Bool {
+        let point = LevelGridPoint(x: Int(projectile.x.rounded(.down)), y: Int(projectile.y.rounded(.down)))
+        if point.x < GameConstants.worldMinX || point.x > GameConstants.worldMaxX || point.y > GameConstants.worldMaxY {
+            return true
+        }
+        if point.y < GameConstants.worldMinY {
+            return false
+        }
+
+        switch level.tiles[point] {
+        case .block, .turret, .homingTurret:
+            return true
+        case .lock:
+            return hasKey == false
+        default:
+            return false
+        }
+    }
+
     private func moveEnemies(_ state: inout LevelPlayState, deltaTime: CGFloat) {
         for index in state.enemies.indices {
             var enemy = state.enemies[index]
@@ -686,11 +771,16 @@ struct ContentView: View {
         state.attackCooldown = 0.34
         state.attackFlash = 0.18
         let reachX = state.playerX + state.facing * 1.08
+        let playerY = state.playerY
         let before = state.enemies.count
+        let projectileBefore = state.projectiles.count
         state.enemies.removeAll { enemy in
-            abs(enemy.x - reachX) < 1.15 && abs(enemy.y - state.playerY) < 1.05
+            abs(enemy.x - reachX) < 1.15 && abs(enemy.y - playerY) < 1.05
         }
-        state.statusText = state.enemies.count < before ? "Enemy hit" : "Attack"
+        state.projectiles.removeAll { projectile in
+            abs(projectile.x - reachX) < 1.15 && abs(projectile.y - playerY) < 0.95
+        }
+        state.statusText = (state.enemies.count < before || state.projectiles.count < projectileBefore) ? "Hit" : "Attack"
         playState = state
     }
 
@@ -771,6 +861,23 @@ struct ContentView: View {
         state.velocityY = -5.2
         state.velocityX = -state.facing * 2.8
         state.statusText = "Enemy contact"
+
+        if state.health <= 0 {
+            state = respawnState(message: "Respawned", previous: state)
+        }
+    }
+
+    private func handleProjectileContact(_ state: inout LevelPlayState) {
+        let rect = playerRect(centerX: state.playerX, centerY: state.playerY)
+        guard let hitIndex = state.projectiles.firstIndex(where: { rect.intersects($0.collisionRect) }) else { return }
+        state.projectiles.remove(at: hitIndex)
+        guard state.invulnerability <= 0 else { return }
+
+        state.health -= 1
+        state.invulnerability = 1.0
+        state.velocityY = -4.6
+        state.velocityX = -state.facing * 2.4
+        state.statusText = "Turret hit"
 
         if state.health <= 0 {
             state = respawnState(message: "Respawned", previous: state)
@@ -896,7 +1003,7 @@ struct ContentView: View {
         }
 
         switch tile {
-        case .block:
+        case .block, .turret, .homingTurret:
             return true
         case .lock:
             return state.hasKey == false
@@ -947,6 +1054,7 @@ private struct LevelControls: View {
     let previousAction: () -> Void
     let nextAction: () -> Void
     let addAction: () -> Void
+    let saveAction: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
@@ -974,6 +1082,7 @@ private struct LevelControls: View {
 
             CompactIconButton(symbol: "chevron.right", isEnabled: levelIndex < levelCount - 1, action: nextAction)
             CompactIconButton(symbol: "plus", isEnabled: true, action: addAction)
+            CompactIconButton(symbol: "tray.and.arrow.down.fill", isEnabled: true, action: saveAction)
         }
     }
 }
@@ -1128,6 +1237,17 @@ private struct LevelCanvasView: View {
                             .position(
                                 x: (enemy.x - camera.x) * metrics.cellSize,
                                 y: (enemy.y - camera.y) * metrics.cellSize
+                            )
+                    }
+                }
+
+                ForEach(playState.projectiles) { projectile in
+                    if isVisible(x: projectile.x, y: projectile.y) {
+                        ProjectileView(isHoming: projectile.isHoming)
+                            .frame(width: metrics.cellSize * 0.34, height: metrics.cellSize * 0.34)
+                            .position(
+                                x: (projectile.x - camera.x) * metrics.cellSize,
+                                y: (projectile.y - camera.y) * metrics.cellSize
                             )
                     }
                 }
@@ -1498,6 +1618,20 @@ private struct EnemyView: View {
     }
 }
 
+private struct ProjectileView: View {
+    let isHoming: Bool
+
+    var body: some View {
+        Circle()
+            .fill(isHoming ? Color.sky : Color.gold)
+            .overlay {
+                Circle()
+                    .stroke(Color.white.opacity(0.7), lineWidth: 1)
+            }
+            .shadow(color: (isHoming ? Color.sky : Color.gold).opacity(0.62), radius: 8)
+    }
+}
+
 private struct MovingPlatformView: View {
     let isLethal: Bool
 
@@ -1748,16 +1882,15 @@ private struct BlockLibraryView: View {
                                 .buttonStyle(.plain)
 
                                 Button {
-                                    addToHotbar(tool)
+                                    toggleHotbar(tool)
                                 } label: {
-                                    Label(hotbarTools.contains(tool) ? "In Hotbar" : "Add to Hotbar", systemImage: hotbarTools.contains(tool) ? "checkmark.circle.fill" : "plus.square.fill")
+                                    Label(hotbarTools.contains(tool) ? "Remove" : "Add to Hotbar", systemImage: hotbarTools.contains(tool) ? "minus.square.fill" : "plus.square.fill")
                                         .font(.caption.weight(.black))
                                         .lineLimit(1)
                                         .minimumScaleFactor(0.74)
                                         .frame(maxWidth: .infinity, minHeight: 30)
                                 }
                                 .buttonStyle(ToolButtonStyle(tint: tool.tint, isSelected: hotbarTools.contains(tool)))
-                                .disabled(hotbarTools.contains(tool))
                             }
                             .padding(10)
                             .frame(minHeight: 140, alignment: .topLeading)
@@ -1781,9 +1914,16 @@ private struct BlockLibraryView: View {
         .preferredColorScheme(.dark)
     }
 
-    private func addToHotbar(_ tool: CreatorTool) {
-        guard hotbarTools.contains(tool) == false else { return }
-        hotbarTools.append(tool)
+    private func toggleHotbar(_ tool: CreatorTool) {
+        if let index = hotbarTools.firstIndex(of: tool) {
+            guard hotbarTools.count > 1 else { return }
+            hotbarTools.remove(at: index)
+            if selectedTool == tool {
+                selectedTool = hotbarTools.first ?? .block
+            }
+        } else {
+            hotbarTools.append(tool)
+        }
         AudioServicesPlaySystemSound(EditorSound.select.systemSoundID)
     }
 }
@@ -2003,6 +2143,16 @@ private enum GameConstants {
     static let defaultJumpPadPower: CGFloat = 18.0
     static let enemySpeed: CGFloat = 1.7
     static let platformSpeed: CGFloat = 2.4
+    static let turretRange: CGFloat = 13.0
+    static let turretFireDelay: CGFloat = 1.2
+    static let homingTurretFireDelay: CGFloat = 1.55
+    static let turretProjectileSpeed: CGFloat = 8.8
+    static let homingProjectileSpeed: CGFloat = 7.2
+    static let homingTurnRate: CGFloat = 0.12
+    static let projectileLife: CGFloat = 3.2
+    static let projectileSize: CGFloat = 0.28
+    static let projectileSpawnOffset: CGFloat = 0.92
+    static let maxProjectiles = 28
     static let minZoom: CGFloat = 0.7
     static let maxZoom: CGFloat = 1.75
 }
@@ -2030,12 +2180,36 @@ private enum EditorSound {
     }
 }
 
-private struct EditableLevel {
+private struct EditableLevel: Codable {
+    private static let customSetKey = "levelCreator.customLevels.v1"
+
     var tiles: [LevelGridPoint: LevelTileKind]
     var enemies: Set<LevelGridPoint>
     var movingPlatforms: [LevelMovingPlatform]
     var start: LevelGridPoint
     var end: LevelGridPoint
+
+    static func savedSet() -> [EditableLevel] {
+        guard
+            let data = UserDefaults.standard.data(forKey: customSetKey),
+            let savedLevels = try? JSONDecoder().decode([EditableLevel].self, from: data),
+            savedLevels.isEmpty == false
+        else {
+            return defaultSet()
+        }
+
+        return savedLevels
+    }
+
+    @discardableResult
+    static func saveCustomSet(_ levels: [EditableLevel]) -> Bool {
+        guard let data = try? JSONEncoder().encode(levels) else {
+            return false
+        }
+
+        UserDefaults.standard.set(data, forKey: customSetKey)
+        return true
+    }
 
     static func defaultSet() -> [EditableLevel] {
         [starter(), empty(), empty()]
@@ -2089,7 +2263,7 @@ private struct EditableLevel {
         }
 
         switch tiles[point] {
-        case .block, .lock:
+        case .block, .lock, .turret, .homingTurret:
             return true
         default:
             return false
@@ -2097,12 +2271,12 @@ private struct EditableLevel {
     }
 }
 
-private struct LevelGridPoint: Hashable {
+private struct LevelGridPoint: Hashable, Codable {
     var x: Int
     var y: Int
 }
 
-private struct LevelMovingPlatform: Identifiable, Equatable {
+private struct LevelMovingPlatform: Identifiable, Equatable, Codable {
     let id: UUID
     var start: LevelGridPoint
     var end: LevelGridPoint
@@ -2124,7 +2298,7 @@ private struct LevelMovingPlatform: Identifiable, Equatable {
     }
 }
 
-private enum LevelTileKind: Equatable {
+private enum LevelTileKind: Equatable, Codable {
     case block
     case kill
     case water
@@ -2140,6 +2314,8 @@ private enum LevelTileKind: Equatable {
     case coin
     case key
     case lock
+    case turret
+    case homingTurret
 
     var symbolName: String {
         switch self {
@@ -2173,6 +2349,10 @@ private enum LevelTileKind: Equatable {
             return "key.fill"
         case .lock:
             return "lock.fill"
+        case .turret:
+            return "scope"
+        case .homingTurret:
+            return "location.north.fill"
         }
     }
 
@@ -2206,6 +2386,10 @@ private enum LevelTileKind: Equatable {
             return Color(red: 0.86, green: 0.62, blue: 0.16)
         case .lock:
             return Color(red: 0.21, green: 0.21, blue: 0.26)
+        case .turret:
+            return Color(red: 0.26, green: 0.23, blue: 0.34)
+        case .homingTurret:
+            return Color(red: 0.18, green: 0.25, blue: 0.36)
         }
     }
 
@@ -2237,6 +2421,10 @@ private enum LevelTileKind: Equatable {
             return Color(red: 1.0, green: 0.94, blue: 0.58)
         case .lock:
             return Color.white.opacity(0.82)
+        case .turret:
+            return Color(red: 1.0, green: 0.62, blue: 0.38)
+        case .homingTurret:
+            return Color(red: 0.52, green: 0.92, blue: 1.0)
         }
     }
 }
@@ -2257,6 +2445,8 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
     case coin
     case key
     case lock
+    case turret
+    case homingTurret
     case moving
     case redMoving
     case enemy
@@ -2269,13 +2459,13 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
 
     static let defaultHotbarTools: [CreatorTool] = [
         .block, .kill, .water, .space, .jumpPad,
-        .moving, .redMoving, .enemy, .start, .end, .delete, .move
+        .moving, .redMoving, .turret, .homingTurret, .enemy, .start, .end, .delete, .move
     ]
 
     static let blockLibraryTools: [CreatorTool] = [
         .block, .kill, .water, .space, .jumpPad,
         .ice, .mud, .conveyorLeft, .conveyorRight, .spring,
-        .checkpoint, .heal, .coin, .key, .lock, .redMoving
+        .checkpoint, .heal, .coin, .key, .lock, .turret, .homingTurret, .redMoving
     ]
 
     var title: String {
@@ -2310,6 +2500,10 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
             return "Key"
         case .lock:
             return "Lock"
+        case .turret:
+            return "Turret"
+        case .homingTurret:
+            return "Homing"
         case .moving:
             return "Moving"
         case .redMoving:
@@ -2361,6 +2555,10 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
             return "Keys unlock lock blocks."
         case .lock:
             return "Locks block the player until a key is held."
+        case .turret:
+            return "Shoots straight at the player."
+        case .homingTurret:
+            return "Shoots tracking projectiles."
         case .delete:
             return "Drag across tiles to remove them."
         default:
@@ -2370,7 +2568,7 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
 
     var supportsDragPainting: Bool {
         switch self {
-        case .block, .kill, .water, .space, .jumpPad, .ice, .mud, .conveyorLeft, .conveyorRight, .spring, .checkpoint, .heal, .coin, .key, .lock, .delete:
+        case .block, .kill, .water, .space, .jumpPad, .ice, .mud, .conveyorLeft, .conveyorRight, .spring, .checkpoint, .heal, .coin, .key, .lock, .turret, .homingTurret, .delete:
             return true
         case .moving, .redMoving, .enemy, .start, .end, .move:
             return false
@@ -2413,6 +2611,10 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
             return "key.fill"
         case .lock:
             return "lock.fill"
+        case .turret:
+            return "scope"
+        case .homingTurret:
+            return "location.north.fill"
         case .moving:
             return "arrow.left.and.right.square.fill"
         case .redMoving:
@@ -2458,6 +2660,10 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
             return Color.gold
         case .lock:
             return Color(red: 0.72, green: 0.74, blue: 0.82)
+        case .turret:
+            return Color(red: 1.0, green: 0.62, blue: 0.36)
+        case .homingTurret:
+            return Color.sky
         case .moving:
             return Color.purplePop
         case .redMoving:
@@ -2507,6 +2713,10 @@ private enum CreatorTool: String, CaseIterable, Identifiable, Equatable {
             return "Unlocks locks"
         case .lock:
             return "Requires key"
+        case .turret:
+            return "Straight shooter"
+        case .homingTurret:
+            return "Tracking shooter"
         case .moving:
             return "Purple path block"
         case .redMoving:
@@ -2548,6 +2758,8 @@ private struct LevelPlayState {
     var jumpBuffer: CGFloat = 0
     var groundGrace: CGFloat = 0
     var enemies: [LevelEnemyState]
+    var projectiles: [LevelProjectileState] = []
+    var turretCooldowns: [LevelGridPoint: CGFloat] = [:]
     var platforms: [LevelMovingPlatformState]
     var isComplete = false
     var statusText = "Reach the End"
@@ -2574,6 +2786,55 @@ private struct LevelEnemyState: Identifiable {
         x = CGFloat(point.x) + 0.5
         y = CGFloat(point.y) + 0.45
         direction = point.x.isMultiple(of: 2) ? 1 : -1
+    }
+}
+
+private struct LevelProjectileState: Identifiable {
+    let id = UUID()
+    var x: CGFloat
+    var y: CGFloat
+    var velocityX: CGFloat
+    var velocityY: CGFloat
+    var isHoming: Bool
+    var life = GameConstants.projectileLife
+
+    init(origin: CGPoint, target: CGPoint, isHoming: Bool) {
+        self.isHoming = isHoming
+        let dx = target.x - origin.x
+        let dy = target.y - origin.y
+        let length = max(hypot(dx, dy), 0.001)
+        let speed = isHoming ? GameConstants.homingProjectileSpeed : GameConstants.turretProjectileSpeed
+        let directionX = dx / length
+        let directionY = dy / length
+        x = origin.x + directionX * GameConstants.projectileSpawnOffset
+        y = origin.y + directionY * GameConstants.projectileSpawnOffset
+        velocityX = directionX * speed
+        velocityY = directionY * speed
+    }
+
+    var collisionRect: CGRect {
+        CGRect(
+            x: x - GameConstants.projectileSize / 2,
+            y: y - GameConstants.projectileSize / 2,
+            width: GameConstants.projectileSize,
+            height: GameConstants.projectileSize
+        )
+    }
+
+    mutating func advance(toward target: CGPoint, deltaTime: CGFloat) {
+        if isHoming {
+            let dx = target.x - x
+            let dy = target.y - y
+            let length = max(hypot(dx, dy), 0.001)
+            let targetX = dx / length * GameConstants.homingProjectileSpeed
+            let targetY = dy / length * GameConstants.homingProjectileSpeed
+            velocityX += (targetX - velocityX) * GameConstants.homingTurnRate
+            velocityY += (targetY - velocityY) * GameConstants.homingTurnRate
+        }
+
+        x += velocityX * deltaTime
+        y += velocityY * deltaTime
+        life -= deltaTime
     }
 }
 
